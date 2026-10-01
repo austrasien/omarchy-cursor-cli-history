@@ -35,7 +35,7 @@ Cursor CLI in a terminal cannot keep the input line stuck at the bottom while yo
 | :--- | :--- | :--- |
 | **Scroll history** | Composer leaves the screen, or scrollback is empty | Sidecar pager; CLI stays on the prompt |
 | **Read and type** | One buffer | Two windows on the same workspace |
-| **Which chat** | Guess from the splash | JSONL for the focused `cursor-agent` cwd |
+| **Which chat** | Guess from the splash | JSONL Cursor actually has open (`store.db` UUID) |
 | **Omarchy** | — | User-space only (`~/.config`) |
 
 **Why not a plugin / hook / PR?** It is a Hyprland bind plus a Python pager. Omarchy has no plugin kind for that. A hook would run on `omarchy update`, not on `Alt+H`. Upstream Omarchy should not hard-code Cursor transcript paths.
@@ -44,17 +44,19 @@ Cursor CLI in a terminal cannot keep the input line stuck at the bottom while yo
 
 ### Transcript, not scrollback
 - Discovers the focused Foot (`org.omarchy.agent`), walks to `cursor-agent`, slugs its cwd the same way Cursor does.
-- Renders `user` / `assistant` text from the JSONL. Reloads when the file grows.
-- Short chats are **bottom-aligned** (last line sits on the row above the status bar).
+- Binds each live CLI window to the conversation UUID in `cursor-agent`’s open `store.db` (several CLIs in the same project no longer steal the newest JSONL).
+- Renders the JSONL like the CLI: tool cards, compact diffs, quote gutter on unchanged lines, Ink-ish colors from the Omarchy theme.
+- Reloads when the file grows. Short chats are **bottom-aligned** (last line sits on the row above the status bar).
 
 ### Hyprland bind, not a Foot key
 - `Alt+H` is bound in `~/.config/hypr/bindings.lua` so it works on an **already-open** CLI window (Foot cannot add keys to a running instance).
 - Uses `hl.get_active_window()`. **Never call `hyprctl` from the bind callback** — that deadlocks the compositor.
 - Non-agent windows ignore `Alt+H` (do not `send_key_state` the same chord; it re-enters the bind).
-- Sidecar class `org.omarchy.agent-history`: tiled, opacity `1 1`, so empty rows do not show the wallpaper.
+- Sidecar class `org.omarchy.agent-history`: tiled next to the CLI (same Foot theme).
 
 ### Optional Foot profile
 - `snippets/foot-agent.ini` turns off Foot scrollback for CLI windows only. Point `cursor-cli.desktop` at `--config=$HOME/.config/foot/agent.ini`.
+- `snippets/foot-agent-history.ini` is the same palette for the sidecar (no extra top pad).
 
 ## Installation (Omarchy)
 
@@ -93,6 +95,12 @@ Then launch Foot as:
 
 ```sh
 foot --config="$HOME/.config/foot/agent.ini" --app-id=org.omarchy.agent
+```
+
+Optional sidecar ini:
+
+```sh
+install -Dm644 snippets/foot-agent-history.ini ~/.config/foot/agent-history.ini
 ```
 
 Existing Foot windows keep the keymap they were started with.

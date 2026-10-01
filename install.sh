@@ -36,3 +36,4 @@ echo "Then: hyprctl reload"
 echo
 echo "Optional: copy snippets/foot-agent.ini to ~/.config/foot/agent.ini"
 echo "and launch Cursor CLI with --config=\$HOME/.config/foot/agent.ini"
+echo "Optional: copy snippets/foot-agent-history.ini to ~/.config/foot/agent-history.ini"
