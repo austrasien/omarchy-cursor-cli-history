@@ -5,10 +5,10 @@ A **user-space companion** for [Omarchy](https://omarchy.org/) that opens a **re
 > **Built for Omarchy + Foot + Cursor CLI.** The CLI clears the terminal scrollback (`CSI 2J` / `CSI 3J`) and has no “pin composer” setting. This pane reads the conversation JSONL under `~/.cursor/projects/<abs-path-with-dashes>/agent-transcripts/` instead.
 
 ```
-Alt+H on Cursor CLI     →  tiled Foot pane, last lines at the bottom
-j / k / mouse wheel     →  scroll; follow the live transcript at the end
-q or Alt+H again        →  close the sidecar
-type in the CLI         →  still works — two windows, two buffers
+Alt+H / Shift+PageUp / wheel-up on Cursor CLI  →  tiled Foot sidecar
+j / k / mouse wheel                            →  scroll; follow live at the end
+q / Esc or Alt+H again                         →  close the sidecar
+type in the CLI                                →  still works — two windows
 ```
 
 This companion only *shows* history. It does not change Cursor, Foot’s default keymap, or Omarchy’s packaged Hyprland bindings.
@@ -45,8 +45,9 @@ Cursor CLI in a terminal cannot keep the input line stuck at the bottom while yo
 ### Transcript, not scrollback
 - Discovers the focused Foot (`org.omarchy.agent`), walks to `cursor-agent`, slugs its cwd the same way Cursor does.
 - Binds each live CLI window to the conversation UUID in `cursor-agent`’s open `store.db` (several CLIs in the same project no longer steal the newest JSONL).
-- Renders the JSONL like the CLI: tool cards, compact diffs, quote gutter on unchanged lines, Ink-ish colors from the Omarchy theme.
+- Renders the JSONL like the CLI: tool cards, compact diffs, GFM tables, quote gutter on unchanged lines, Ink-ish colors from the Omarchy theme.
 - Reloads when the file grows. Short chats are **bottom-aligned** (last line sits on the row above the status bar).
+- Optional Foot bind: wheel-up / Shift+PageUp opens the same sidecar (`snippets/foot-agent.ini`).
 
 ### Hyprland bind, not a Foot key
 - `Alt+H` is bound in `~/.config/hypr/bindings.lua` so it works on an **already-open** CLI window (Foot cannot add keys to a running instance).

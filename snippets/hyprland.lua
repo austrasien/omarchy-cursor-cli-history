@@ -1,3 +1,7 @@
--- Agent history sidecar: tile next to Cursor CLI. Same default opacity
--- as the CLI so the Foot theme (bg / font) matches.
-o.window("org.omarchy.agent-history", { tile = true, float = false })
+-- Agent history: tile beside Cursor CLI. Strip +terminal from org.omarchy.*
+-- (terminals.lua) so the sidecar stays a normal tiled pane.
+o.window("org.omarchy.agent-history", {
+  tag = "-terminal",
+  tile = true,
+  float = false,
+})

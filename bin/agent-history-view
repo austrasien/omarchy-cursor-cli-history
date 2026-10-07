@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Side pane for Cursor CLI history.
+"""Cursor CLI history sidecar.
 
-Foot scrollback is empty (the CLI clears it). This reads the conversation
-JSONL under ~/.cursor/projects/<abs-path-with-dashes>/agent-transcripts.
+Foot scrollback is empty (alt-screen). Reads JSONL under
+~/.cursor/projects/<slug>/agent-transcripts and shows it in a curses pager
+tiled beside the agent (tables + Omarchy theme). Optional: --glow.
 """
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ import locale
 import os
 import re
 import select
+import shutil
 import subprocess
 import sys
 import time
@@ -20,8 +22,19 @@ from pathlib import Path
 
 CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "omarchy"
 TARGET = CACHE / "agent-history.target"
+SOURCE = CACHE / "agent-history.source.json"
+LAUNCH_GUARD = CACHE / "agent-history.launching"
+MARKDOWN = CACHE / "agent-history.md"
+GLOW_BIN = shutil.which("glow") or "glow"
 SELF = Path(__file__).resolve()
 HZ = os.sysconf("SC_CLK_TCK")
+AGENT_CLASSES = frozenset(
+    {
+        "org.omarchy.agent",
+        "org.omarchy.agent.forge",
+    }
+)
+HISTORY_CLASS = "org.omarchy.agent-history"
 QUERY_RE = re.compile(
     r"<timestamp>.*?</timestamp>\s*<user_query>\s*(.*?)\s*</user_query>",
     re.DOTALL,
@@ -217,24 +230,135 @@ def hypr_active() -> dict:
 
 
 def focused_agent_pid() -> int | None:
+    source = source_agent_window()
+    if not source:
+        return None
+    try:
+        return int(source["pid"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def source_agent_window() -> dict | None:
+    """Agent (or forge) window that history should cover."""
     window = hypr_active()
     cls = window.get("class") or ""
-    if cls == "org.omarchy.agent":
-        return int(window["pid"])
-    if cls == "org.omarchy.agent-history":
+    if cls in AGENT_CLASSES:
+        return window
+    if cls == HISTORY_CLASS:
+        try:
+            raw = json.loads(SOURCE.read_text(encoding="utf-8"))
+            addr = str(raw.get("address") or "")
+        except (OSError, json.JSONDecodeError, TypeError):
+            addr = ""
+        if addr:
+            for client in hypr_clients():
+                if str(client.get("address") or "") == addr:
+                    return client
         workspace = (window.get("workspace") or {}).get("id")
         for client in hypr_clients():
-            if client.get("class") == "org.omarchy.agent" and (
+            if client.get("class") in AGENT_CLASSES and (
                 client.get("workspace") or {}
             ).get("id") == workspace:
-                return int(client["pid"])
+                return client
     return None
+
+
+def history_client() -> dict | None:
+    for client in hypr_clients():
+        if client.get("class") == HISTORY_CLASS:
+            return client
+    return None
+
+
+def hypr_dispatch(lua_expr: str) -> None:
+    """Omarchy hyprctl only accepts Lua dispatchers (hl.dsp.*)."""
+    try:
+        subprocess.run(
+            ["hyprctl", "dispatch", lua_expr],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        pass
+
+
+def write_source(window: dict | None) -> None:
+    CACHE.mkdir(parents=True, exist_ok=True)
+    if not window:
+        try:
+            SOURCE.unlink()
+        except OSError:
+            pass
+        return
+    payload = {
+        "address": str(window.get("address") or ""),
+        "at": list(window.get("at") or [0, 0]),
+        "size": list(window.get("size") or [0, 0]),
+        "workspace": (window.get("workspace") or {}).get("id"),
+        "class": window.get("class") or "",
+    }
+    SOURCE.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+
+def read_source() -> dict | None:
+    try:
+        return json.loads(SOURCE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def focus_address(address: str | None) -> None:
+    if not address:
+        return
+    hypr_dispatch(f'hl.dsp.focus({{ window = "address:{address}" }})')
+
+
+def place_history_tiled(agent: dict | None) -> bool:
+    """Keep history on the agent's workspace and focus it (tiled by windowrule)."""
+    hist = None
+    for _ in range(40):
+        hist = history_client()
+        if hist is not None:
+            break
+        time.sleep(0.05)
+    if hist is None:
+        return False
+    addr = str(hist.get("address") or "")
+    if not addr:
+        return False
+    win = f'window = "address:{addr}"'
+    # If a previous version left it floating, put it back in the layout.
+    if hist.get("floating"):
+        hypr_dispatch(f'hl.dsp.window.float({{ action = "toggle", {win} }})')
+    ws = (agent or {}).get("workspace") or {}
+    ws_id = ws.get("id") if isinstance(ws, dict) else None
+    if ws_id is not None:
+        hypr_dispatch(
+            f'hl.dsp.window.move({{ workspace = "{ws_id}", follow = true, {win} }})'
+        )
+    hypr_dispatch(f'hl.dsp.focus({{ {win} }})')
+    return True
+
+
+def recently_launching(seconds: float = 0.8) -> bool:
+    try:
+        age = time.time() - LAUNCH_GUARD.stat().st_mtime
+    except OSError:
+        return False
+    return age < seconds
+
+
+def mark_launching() -> None:
+    CACHE.mkdir(parents=True, exist_ok=True)
+    LAUNCH_GUARD.write_text(str(time.time()) + "\n", encoding="utf-8")
 
 
 def windows_from_hypr() -> list[dict]:
     windows: list[dict] = []
     for client in hypr_clients():
-        if client.get("class") != "org.omarchy.agent":
+        if client.get("class") not in AGENT_CLASSES:
             continue
         address = str(client.get("address") or "")
         try:
@@ -591,16 +715,145 @@ def diff_rows(old: str, new: str, width: int, nd=None) -> list[tuple]:
     return rows
 
 
+def is_table_sep(line: str) -> bool:
+    s = line.strip()
+    if "|" not in s:
+        return False
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    parts = [p.strip() for p in s.split("|")]
+    if len(parts) < 2:
+        return False
+    return all(bool(re.fullmatch(r":?-{1,}:?", p.replace(" ", ""))) for p in parts)
+
+
+def is_table_row(line: str) -> bool:
+    s = line.strip()
+    if s.count("|") < 2:
+        return False
+    if is_table_sep(s):
+        return True
+    # Avoid treating random prose with a pipe as a table cell row alone;
+    # block detection requires a separator line.
+    return True
+
+
+def split_table_cells(line: str) -> list[str]:
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    return [c.strip() for c in s.split("|")]
+
+
+def plain_cell(text: str) -> str:
+    """Strip light markdown for width math; keep readable text."""
+    t = text or ""
+    t = re.sub(r"\*\*(.+?)\*\*", r"\1", t)
+    t = re.sub(r"`([^`]+)`", r"\1", t)
+    return t
+
+
+def render_table(block: list[str], width: int) -> list[tuple]:
+    """GFM pipe table → aligned terminal rows (header + rule + body)."""
+    rows_out: list[tuple] = []
+    parsed: list[list[str]] = []
+    for line in block:
+        if is_table_sep(line):
+            continue
+        cells = split_table_cells(line)
+        if cells:
+            parsed.append(cells)
+    if not parsed:
+        return rows_out
+    cols = max(len(r) for r in parsed)
+    for r in parsed:
+        while len(r) < cols:
+            r.append("")
+    widths = [0] * cols
+    for r in parsed:
+        for i, cell in enumerate(r):
+            widths[i] = max(widths[i], len(plain_cell(cell)))
+    # gutters: one space between columns
+    sep = 2
+    total = sum(widths) + sep * max(0, cols - 1)
+    if total > width and cols:
+        # Shrink widest columns until it fits; floor 3 chars/col.
+        overflow = total - width
+        order = sorted(range(cols), key=lambda i: widths[i], reverse=True)
+        while overflow > 0:
+            grew = False
+            for i in order:
+                if widths[i] <= 3:
+                    continue
+                widths[i] -= 1
+                overflow -= 1
+                grew = True
+                if overflow <= 0:
+                    break
+            if not grew:
+                break
+
+    def fmt_row(cells: list[str], header: bool) -> list[tuple]:
+        # Wrap each cell to its column width, then zip into display lines.
+        wrapped_cols: list[list[str]] = []
+        for i, cell in enumerate(cells):
+            cw = max(3, widths[i])
+            plain = plain_cell(cell)
+            wrapped_cols.append(wrap_one(plain, cw) if plain else [""])
+        height = max(len(col) for col in wrapped_cols)
+        out: list[tuple] = []
+        for line_i in range(height):
+            spans: list[tuple[str, str]] = []
+            for i, col_lines in enumerate(wrapped_cols):
+                piece = col_lines[line_i] if line_i < len(col_lines) else ""
+                piece = clip(piece, widths[i]).ljust(widths[i])
+                style = "heading" if header else "text"
+                spans.append((style, piece))
+                if i < cols - 1:
+                    spans.append(("muted", " " * sep))
+            rows_line = "".join(t for _, t in spans)
+            if len(rows_line) > width:
+                # Hard clip if still over (edge case).
+                cut = 0
+                trimmed: list[tuple[str, str]] = []
+                for style, text in spans:
+                    if cut >= width:
+                        break
+                    take = text[: width - cut]
+                    trimmed.append((style, take))
+                    cut += len(take)
+                spans = trimmed
+            out.append(("spans", spans, ""))
+        return out
+
+    header = parsed[0]
+    body = parsed[1:]
+    rows_out.extend(fmt_row(header, True))
+    rule = "─" * min(width, sum(widths) + sep * max(0, cols - 1))
+    rows_out.append(("spans", [("muted", rule)], ""))
+    for cells in body:
+        rows_out.extend(fmt_row(cells, False))
+    return rows_out
+
+
 def markdown_rows(text: str, width: int) -> list[tuple]:
     rows: list[tuple] = []
     in_fence = False
-    for raw in (text or "").splitlines():
+    lines = (text or "").splitlines()
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
         stripped = raw.strip()
         if stripped.startswith("```"):
             in_fence = not in_fence
             lang = stripped[3:].strip()
             if in_fence and lang:
                 rows.append(("spans", [("quote", QUOTE_CH), ("muted", lang)], ""))
+            i += 1
             continue
         if in_fence:
             inner = max(8, width - 1)
@@ -613,15 +866,32 @@ def markdown_rows(text: str, width: int) -> list[tuple]:
                         "",
                     )
                 )
+            i += 1
+            continue
+        # GFM table: header row + separator, then body rows.
+        if (
+            i + 1 < len(lines)
+            and is_table_row(raw)
+            and is_table_sep(lines[i + 1])
+        ):
+            block = [raw, lines[i + 1]]
+            j = i + 2
+            while j < len(lines) and is_table_row(lines[j]) and lines[j].strip():
+                block.append(lines[j])
+                j += 1
+            rows.extend(render_table(block, width))
+            i = j
             continue
         if not raw.strip():
             rows.append(("blank", "", ""))
+            i += 1
             continue
         quote = re.match(r"^>\s?(.*)$", raw)
         if quote:
             spans = [("quote", QUOTE_CH)] + parse_inline(quote.group(1))
             for line in wrap_spans(spans, width):
                 rows.append(("spans", line, ""))
+            i += 1
             continue
         heading = re.match(r"^(#{1,6})\s+(.*)$", raw)
         if heading:
@@ -633,21 +903,25 @@ def markdown_rows(text: str, width: int) -> list[tuple]:
                         "",
                     )
                 )
+            i += 1
             continue
         bullet = re.match(r"^[-*]\s+(.*)$", raw)
         if bullet:
             spans = [("text", "• ")] + parse_inline(bullet.group(1))
             for line in wrap_spans(spans, width):
                 rows.append(("spans", line, ""))
+            i += 1
             continue
         numbered = re.match(r"^(\d+)\.\s+(.*)$", raw)
         if numbered:
             spans = [("text", f"{numbered.group(1)}. ")] + parse_inline(numbered.group(2))
             for line in wrap_spans(spans, width):
                 rows.append(("spans", line, ""))
+            i += 1
             continue
         for line in wrap_spans(parse_inline(raw), width):
             rows.append(("spans", line, ""))
+        i += 1
     return rows
 
 
@@ -785,6 +1059,43 @@ def layout_rows(jsonl: Path | None, width: int) -> list[tuple]:
         rows = [("text", "(conversation encore vide)", "")]
     _LAYOUT_CACHE = (key, rows)
     return rows
+
+
+def export_markdown(jsonl: Path) -> str:
+    """JSONL → Markdown. Assistant text kept as-is (tables for glow)."""
+    if jsonl is None or not jsonl.is_file():
+        return "(pas de transcript)\n"
+    if jsonl.suffix != ".jsonl":
+        try:
+            return jsonl.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return f"(lecture impossible: {exc})\n"
+
+    chunks: list[str] = []
+    for event in iter_parts(jsonl):
+        kind = event[0]
+        if kind == "user":
+            body = (event[1] or "").strip()
+            if not body:
+                continue
+            chunks.append(f"### You\n\n{body}\n")
+        elif kind == "assistant":
+            body = (event[1] or "").rstrip()
+            if body:
+                chunks.append(body + "\n")
+        elif kind == "tool":
+            name = event[1]
+            inp = event[2] if len(event) > 2 else {}
+            if not isinstance(inp, dict):
+                inp = {}
+            _tk, verb, rest = tool_line(name, inp)
+            if name == "Shell" and rest:
+                chunks.append(f"```bash\n{rest}\n```\n")
+            elif rest:
+                chunks.append(f"- **{verb}** `{rest}`\n")
+            else:
+                chunks.append(f"- **{verb}**\n")
+    return "\n".join(chunks) if chunks else "(conversation encore vide)\n"
 
 
 def render(jsonl: Path) -> str:
@@ -1047,12 +1358,12 @@ def write_target(jsonl: Path) -> None:
 
 
 def sidecar_running() -> bool:
-    return any(c.get("class") == "org.omarchy.agent-history" for c in hypr_clients())
+    return history_client() is not None
 
 
 def close_sidecar() -> None:
     for client in hypr_clients():
-        if client.get("class") != "org.omarchy.agent-history":
+        if client.get("class") != HISTORY_CLASS:
             continue
         pid = client.get("pid")
         if pid:
@@ -1060,6 +1371,12 @@ def close_sidecar() -> None:
                 os.kill(int(pid), 15)
             except OSError:
                 pass
+
+
+def focus_sidecar() -> None:
+    hist = history_client()
+    if hist:
+        focus_address(str(hist.get("address") or ""))
 
 
 def launch_pager() -> None:
@@ -1079,13 +1396,12 @@ def launch_pager() -> None:
         [
             "--app-id=org.omarchy.agent-history",
             "--title=Agent history",
-            "-o",
-            "pad=14x14",
             "-e",
             str(SELF),
             "--pager",
         ]
     )
+    mark_launching()
     subprocess.Popen(
         cmd,
         stdin=subprocess.DEVNULL,
@@ -1093,6 +1409,36 @@ def launch_pager() -> None:
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
+
+
+def write_markdown_from_target() -> Path:
+    CACHE.mkdir(parents=True, exist_ok=True)
+    jsonl = read_target()
+    MARKDOWN.write_text(
+        export_markdown(jsonl) if jsonl else "(pas de transcript)\n",
+        encoding="utf-8",
+    )
+    return MARKDOWN
+
+
+def glow_pager() -> int:
+    """Optional Markdown viewer (agent-history-view --glow)."""
+    source = read_source() or {}
+    source_addr = str(source.get("address") or "")
+    md = write_markdown_from_target()
+    cols = max(40, shutil.get_terminal_size((100, 40)).columns - 2)
+    cmd = [GLOW_BIN, "-t", "-w", str(cols), str(md)]
+    try:
+        subprocess.run(cmd, check=False)
+    except FileNotFoundError:
+        sys.stderr.write(
+            "glow introuvable — sudo pacman -S glow\n"
+            f"(markdown exporté: {md})\n"
+        )
+        return 1
+    finally:
+        focus_address(source_addr)
+    return 0
 
 
 def pager(stdscr: curses.window) -> None:
@@ -1109,108 +1455,148 @@ def pager(stdscr: curses.window) -> None:
     follow = True
     last_target = -1.0
     jsonl = read_target()
+    source = read_source() or {}
+    source_addr = str(source.get("address") or "")
 
-    while True:
-        h, w = stdscr.getmaxyx()
-        body_h = max(1, h - 1)
-        col_w = max(16, w)
-        try:
-            tgt_m = TARGET.stat().st_mtime
-        except OSError:
-            tgt_m = 0.0
-        if tgt_m != last_target:
-            jsonl = read_target()
-            last_target = tgt_m
-        wrapped = layout_rows(jsonl, max(16, w - 1))
-        max_off = max(0, len(wrapped) - body_h)
-        if follow:
-            offset = max_off
-        offset = min(max(0, offset), max_off)
-        stdscr.erase()
-        # Short conversations: pad from the top so the last line sits on the
-        # row above the status bar.
-        if len(wrapped) < body_h:
-            top = body_h - len(wrapped)
-            view = wrapped
-            row0 = top
-        else:
-            view = wrapped[offset : offset + body_h]
-            row0 = 0
-        for i, row in enumerate(view):
-            paint_row(stdscr, row0 + i, row, col_w, colors)
-        status = " Agent history   q quit  j/k scroll  g haut  G bas "
-        paint(stdscr, h - 1, status, col_w, colors["status"])
-        stdscr.refresh()
-        key = stdscr.getch()
-        if key == -1:
-            continue
-        if key == curses.KEY_RESIZE:
-            follow = True
-            continue
-        if key in (ord("q"), ord("Q")):
-            break
-        if key in (ord("j"), curses.KEY_DOWN):
-            if offset < max_off:
-                offset += 1
-                follow = offset >= max_off
-        elif key in (ord("k"), curses.KEY_UP):
-            if offset > 0 or (len(wrapped) < body_h):
-                offset = max(0, offset - 1)
-                follow = False
-        elif key in (curses.KEY_NPAGE, ord(" ")):
-            offset = min(max_off, offset + body_h)
-            follow = offset >= max_off
-        elif key == curses.KEY_PPAGE:
-            offset = max(0, offset - body_h)
-            follow = False
-        elif key in (ord("g"), curses.KEY_HOME):
-            offset = 0
-            follow = False
-        elif key in (ord("G"), curses.KEY_END):
-            offset = max_off
-            follow = True
-        elif key == curses.KEY_MOUSE:
+    try:
+        while True:
+            h, w = stdscr.getmaxyx()
+            body_h = max(1, h - 1)
+            col_w = max(16, w)
             try:
-                _id, _x, _y, _z, bstate = curses.getmouse()
-            except curses.error:
+                tgt_m = TARGET.stat().st_mtime
+            except OSError:
+                tgt_m = 0.0
+            if tgt_m != last_target:
+                jsonl = read_target()
+                last_target = tgt_m
+            wrapped = layout_rows(jsonl, max(16, w - 1))
+            max_off = max(0, len(wrapped) - body_h)
+            if follow:
+                offset = max_off
+            offset = min(max(0, offset), max_off)
+            stdscr.erase()
+            if len(wrapped) < body_h:
+                top = body_h - len(wrapped)
+                view = wrapped
+                row0 = top
+            else:
+                view = wrapped[offset : offset + body_h]
+                row0 = 0
+            for i, row in enumerate(view):
+                paint_row(stdscr, row0 + i, row, col_w, colors)
+            status = " Historique   molette/j/k  q ou Esc = retour CLI "
+            paint(stdscr, h - 1, status, col_w, colors["status"])
+            stdscr.refresh()
+            key = stdscr.getch()
+            if key == -1:
                 continue
-            if bstate & curses.BUTTON4_PRESSED:
-                offset = max(0, offset - 3)
-                follow = False
-            elif bstate & curses.BUTTON5_PRESSED:
-                offset = min(max_off, offset + 3)
+            if key == curses.KEY_RESIZE:
+                follow = True
+                continue
+            if key in (ord("q"), ord("Q"), 27):
+                break
+            if key in (ord("j"), curses.KEY_DOWN):
+                if offset < max_off:
+                    offset += 1
+                    follow = offset >= max_off
+            elif key in (ord("k"), curses.KEY_UP):
+                if offset > 0 or (len(wrapped) < body_h):
+                    offset = max(0, offset - 1)
+                    follow = False
+            elif key in (curses.KEY_NPAGE, ord(" ")):
+                offset = min(max_off, offset + body_h)
                 follow = offset >= max_off
+            elif key == curses.KEY_PPAGE:
+                offset = max(0, offset - body_h)
+                follow = False
+            elif key in (ord("g"), curses.KEY_HOME):
+                offset = 0
+                follow = False
+            elif key in (ord("G"), curses.KEY_END):
+                offset = max_off
+                follow = True
+            elif key == curses.KEY_MOUSE:
+                try:
+                    _id, _x, _y, _z, bstate = curses.getmouse()
+                except curses.error:
+                    continue
+                if bstate & curses.BUTTON4_PRESSED:
+                    offset = max(0, offset - 3)
+                    follow = False
+                elif bstate & curses.BUTTON5_PRESSED:
+                    offset = min(max_off, offset + 3)
+                    follow = offset >= max_off
+    finally:
+        focus_address(source_addr)
 
 
-def launch_mode() -> int:
-    drain_stdin()
+def prepare_target() -> Path:
     jsonl = discover_jsonl()
     CACHE.mkdir(parents=True, exist_ok=True)
     if jsonl is None:
         fallback = CACHE / "agent-history-empty.txt"
         fallback.write_text("(pas de transcript Cursor trouvé pour cette fenêtre)\n")
         write_target(fallback)
-    else:
-        write_target(jsonl)
-    close_sidecar()
-    time.sleep(0.05)
+        return fallback
+    write_target(jsonl)
+    return jsonl
+
+
+def open_overlay() -> int:
+    """Open or focus history tiled beside the agent (wheel / Shift+PageUp)."""
+    drain_stdin()
+    if recently_launching() and sidecar_running():
+        focus_sidecar()
+        return 0
+    agent = source_agent_window()
+    write_source(agent)
+    prepare_target()
+    if sidecar_running():
+        place_history_tiled(agent)
+        return 0
     launch_pager()
+    place_history_tiled(agent)
     return 0
 
 
+def toggle_overlay() -> int:
+    """Alt+H: open overlay, or close it when already focused."""
+    drain_stdin()
+    active = hypr_active()
+    cls = active.get("class") or ""
+    if cls == HISTORY_CLASS:
+        source = read_source() or {}
+        close_sidecar()
+        focus_address(str(source.get("address") or ""))
+        return 0
+    return open_overlay()
+
+
+def launch_mode() -> int:
+    return toggle_overlay()
+
+
 def main() -> int:
-    if len(sys.argv) > 1 and sys.argv[1] == "--pager":
+    args = sys.argv[1:]
+    if args and args[0] == "--pager":
         locale.setlocale(locale.LC_ALL, "")
         curses.wrapper(pager)
         return 0
-    if len(sys.argv) > 1 and sys.argv[1] == "--render":
-        path = Path(sys.argv[2]) if len(sys.argv) > 2 else discover_jsonl()
+    if args and args[0] == "--glow":
+        return glow_pager()
+    if args and args[0] == "--render":
+        path = Path(args[1]) if len(args) > 1 else discover_jsonl()
         if path is None:
             print("(pas de transcript)", file=sys.stderr)
             return 1
         sys.stdout.write(render(path))
         return 0
-    return launch_mode()
+    if args and args[0] == "--open":
+        return open_overlay()
+    if args and args[0] == "--toggle":
+        return toggle_overlay()
+    return toggle_overlay()
 
 
 if __name__ == "__main__":
